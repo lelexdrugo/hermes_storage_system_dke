@@ -1,0 +1,138 @@
+version: '3.9'
+services:
+  mongo1:
+    image: mongo:5.0
+    hostname: mongo1
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin-user
+      - MONGO_INITDB_ROOT_PASSWORD=admin-password
+      - MONGO_INITDB_DATABASE=admin
+    expose:
+      - 27017
+    #    ports:
+    #      - 27017:27017
+    restart: always
+    volumes:
+      - ${MONGODB_VOLUME}/init_file/init.js:/docker-entrypoint-initdb.d/init.js:ro
+      - ${MONGODB_VOLUME}/replica.key:/data/replica.key
+      - ${MONGODB_VOLUME}/healthcheck.sh:/healthcheck.sh
+    command: mongod --port 27017 --replSet rs0 --bind_ip_all --keyFile /data/replica.key
+    #https://github.com/docker-library/mongo/issues/475
+  #    entrypoint:
+  #      - bash
+  #      - -c
+  #      - |
+  #        chmod 400 /data/replica.key
+  #        chown 999:999 /data/replica.key
+    healthcheck:
+      test: 'bash healthcheck.sh'
+      # test: bash -c "mongosh --host mongo1:27017 && db.hello().isWritablePrimary"
+      interval: 5s
+      timeout: 10s
+      retries: 50
+
+  mongosetuprs:
+    image: mongo:5.0
+    volumes:
+      - ${MONGOSETUPRS_VOLUME}/deployment_scripts:/deployment_scripts
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin-user
+      - MONGO_INITDB_ROOT_PASSWORD=admin-password
+    entrypoint:
+      - deployment_scripts/initiate_replica.sh
+      # WARN : chmod +x e dos2unix on this sh
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:6.0.14
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    #    ports:
+    #      - 22181:2181
+    expose:
+      - 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:6.0.14
+    depends_on:
+      - zookeeper
+    #    ports:
+    #      - 29092:29092
+    expose:
+      - 29092
+    environment:
+      KAFKA_ADVERTISED_HOST_NAME: 'kafka'
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+
+  hermes:
+    image: gabriele_storage_service${TRANSACTIONALITY}:5
+    environment:
+      # - JAVA_TOOL_OPTIONS=-XX:MaxHeapSize=16384m -XX:InitialHeapSize=512m
+      #Devo passare queste opzioni, non riesco a modificare il gradle per inserirle in fase di creazione del dockerfile
+      #Se non sovrascrivo la max direct memory size che viene settata di default tra le java tool options, vado comunque in overflow
+      - JAVA_TOOL_OPTIONS=-Xmx16384m -Xms512m -XX:MaxDirectMemorySize=12288m
+      - spring.data.mongodb.uri=mongodb://gabriele:test@mongo1:27017/admin
+      - benchmarking=true
+      - spring.kafka.bootstrap-servers=kafka:9092
+      - spring.kafka.consumer.group-id=${TRANSACTIONALITY}
+      # - spring.kafka.consumer.max-poll-records=1000
+      # - spring.kafka.consumer.fetch-max-bytes=52428800
+      - spring.kafka.concurrency-listener=${CONCURRENCY_LISTENER}
+      - spring.kafka.topics.number-of-partitions=${NUMBER_OF_PARTITIONS}
+      - spring.kafka.consumer.max-partition-fetch-bytes=${MAX_PARTITION_FETCH_BYTES}
+      - spring.kafka.batchListener.enabled=${BATCH_LISTENER}
+      - spring.kafka.batchListener.aggregation=${BATCH_AGGREGATION}
+      - bulk-write=${BULK_WRITE}
+      - kind-of-transactionality=${TRANSACTIONALITY}
+      - number-of-generator-threads=${NUMBER_OF_GENERATOR_THREADS}
+      - sending-bytes-rate=${SENDING_BYTES_RATE}
+    depends_on:
+        kafka:
+            condition: service_started
+        # mongosetuprs:
+        #     condition: service_completed_successfully
+        mongo1:
+            condition: service_healthy
+    ports:
+      - "45003:8080"
+    volumes:
+      - ${HERMES_VOLUME_STATS}:/workspace/data/stats
+      - ${HERMES_VOLUME}/healthcheck.sh:/healthcheck.sh
+    healthcheck:
+      test: 'bash /../healthcheck.sh'
+      # test: bash -c "mongosh --host mongo1:27017 && db.hello().isWritablePrimary"
+      interval: 5s
+      timeout: 10s
+      retries: 50
+
+  client:
+    image: gabriele_storage_service_client:5
+    environment:
+      - JAVA_TOOL_OPTIONS=-XX:MaxHeapSize=12288m -XX:InitialHeapSize=512m -XX:MaxDirectMemorySize=8192m
+      #https://gist.github.com/rmoff/fb7c39cc189fc6082a5fbd390ec92b3d
+      - spring.kafka.bootstrap-servers=kafka:9092
+      - number-of-generator-threads=${NUMBER_OF_GENERATOR_THREADS}
+      - sending-bytes-rate=${SENDING_BYTES_RATE}
+      # - spring.kafka.producer.isProducerPerThread=false
+      # - spring.kafka.producer.linger=100
+      #20
+      # - spring.kafka.producer.batchSize=20971520
+      #655360
+      # - spring.kafka.producer.compressionType=snappy
+      # - spring.kafka.producer.bufferMemory=51943040
+      # - spring.kafka.producer.acks=0
+    command:
+      - useFileMap
+      - ${NUMBER_OF_FILE_TO_GENERATE}
+      - "104857600"
+    depends_on:
+      kafka:
+          condition: service_started
+      hermes: 
+          condition: service_healthy
+
